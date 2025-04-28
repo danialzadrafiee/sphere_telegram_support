@@ -4,15 +4,15 @@ import { ConfigService } from '@nestjs/config';
 import { Telegraf, Markup, Context } from 'telegraf';
 import { AIService } from 'src/ai/ai.service';
 import { QAService } from 'src/qa/qa.service';
-import { NextFunction } from 'express';
 import { IncomingMessage, ServerResponse } from 'http';
 import { Update } from 'telegraf/typings/core/types/typegram';
+import { PrismaService } from 'src/prisma/prisma.service';
 
 @Injectable()
 export class TelegramService implements OnModuleInit {
     private bot: Telegraf;
     private processingUsers = new Set<number>();
-
+    private DAILY_MESSAGE_LIMIT = 200; 
     // Keyboards
     private mainMenuKeyboard = Markup.keyboard([
         ['💰 تعرفه پاس کردن چالش‌ها', '⚠️ قوانین و محدودیت‌ها'],
@@ -67,6 +67,7 @@ export class TelegramService implements OnModuleInit {
         private configService: ConfigService,
         private aiService: AIService,
         private qaService: QAService,
+        private prisma: PrismaService, 
     ) {
         this.bot = new Telegraf(this.configService.get<string>('TELEGRAM_TOKEN') || '');
     }
@@ -103,10 +104,12 @@ export class TelegramService implements OnModuleInit {
     }
 
     private setupBot() {
-        // Start command handler
         this.bot.start(async (ctx) => {
             const userId = ctx.from.id;
             const userName = ctx.from.first_name || 'کاربر';
+
+            // Register or update user in database
+            await this.getOrCreateUser(ctx);
 
             const welcomeMessage =
                 `🌟 سلام ${userName} عزیز، خوش آمدید! 🌟\n\n` +
@@ -116,6 +119,7 @@ export class TelegramService implements OnModuleInit {
 
             await ctx.reply(welcomeMessage, this.mainMenuKeyboard);
         });
+
 
         // Back button handler
         this.bot.hears('🔙 بازگشت به منوی اصلی', (ctx) => {
@@ -171,15 +175,15 @@ export class TelegramService implements OnModuleInit {
             this.bot.hears(question, async (ctx) => {
                 const userId = ctx.from.id;
                 if (this.processingUsers.has(userId)) return;
-
+                if (!await this.checkMessageLimit(ctx)) return;
                 const answered = await this.sendHardcodedAnswer(ctx, question);
                 if (!answered) {
                     await this.processQuestionWithAI(ctx, question);
                 }
+                await this.logMessage(ctx, question, answered ? this.qaService.getAnswer(question) || "" : "AI Response");
             });
         });
 
-        // Free text handler
         this.bot.on('text', async (ctx) => {
             const userId = ctx.from.id;
             const query = ctx.message.text;
@@ -197,8 +201,111 @@ export class TelegramService implements OnModuleInit {
                 return;
             }
 
+            // Check message limit first
+            if (!await this.checkMessageLimit(ctx)) return;
+
             await this.processQuestionWithAI(ctx, query);
         });
+    }
+
+    private async getOrCreateUser(ctx: Context) {
+        if (!ctx.from) return null;
+
+        const telegramId = BigInt(ctx.from.id);
+        try {
+            // Find user or create if doesn't exist
+            const user = await this.prisma.user.upsert({
+                where: { telegramId },
+                update: {
+                    firstName: ctx.from.first_name || null,
+                    lastName: ctx.from.last_name || null,
+                    username: ctx.from.username || null,
+                },
+                create: {
+                    telegramId,
+                    firstName: ctx.from.first_name || null,
+                    lastName: ctx.from.last_name || null,
+                    username: ctx.from.username || null,
+                    messageCount: 0,
+                    dailyCount: 0,
+                    lastResetDate: new Date(),
+                }
+            });
+            return user;
+        } catch (error) {
+            console.error('Error getting/creating user:', error);
+            return null;
+        }
+    }
+
+    private async checkMessageLimit(ctx: Context): Promise<boolean> {
+        if (!ctx.from) return false;
+
+        const user = await this.getOrCreateUser(ctx);
+        if (!user) return false;
+
+        // Reset counter if it's a new day
+        const now = new Date();
+        const lastReset = user.lastResetDate || new Date(0);
+
+        if (now.getDate() !== lastReset.getDate() ||
+            now.getMonth() !== lastReset.getMonth() ||
+            now.getFullYear() !== lastReset.getFullYear()) {
+
+            await this.prisma.user.update({
+                where: { id: user.id },
+                data: {
+                    dailyCount: 0,
+                    lastResetDate: now
+                }
+            });
+
+            // Fetch updated user
+            const updatedUser = await this.prisma.user.findUnique({
+                where: { id: user.id }
+            });
+
+            if (!updatedUser) return false;
+
+            if (updatedUser.dailyCount >= this.DAILY_MESSAGE_LIMIT) {
+                await ctx.reply('⚠️ شما به محدودیت پیام روزانه رسیده‌اید. لطفاً فردا دوباره تلاش کنید.');
+                return false;
+            }
+        } else if (user.dailyCount >= this.DAILY_MESSAGE_LIMIT) {
+            await ctx.reply('⚠️ شما به محدودیت پیام روزانه رسیده‌اید. لطفاً فردا دوباره تلاش کنید.');
+            return false;
+        }
+
+        return true;
+    }
+    private async logMessage(ctx: Context, content: string, response: string) {
+        if (!ctx.from) return;
+
+        const user = await this.getOrCreateUser(ctx);
+        if (!user) return;
+
+        try {
+            // Update user's message count and last message time
+            await this.prisma.user.update({
+                where: { id: user.id },
+                data: {
+                    messageCount: { increment: 1 },
+                    dailyCount: { increment: 1 },
+                    lastMessageDate: new Date()
+                }
+            });
+
+            // Create message record
+            await this.prisma.message.create({
+                data: {
+                    userId: user.id,
+                    content,
+                    response
+                }
+            });
+        } catch (error) {
+            console.error('Error logging message:', error);
+        }
     }
 
     private async sendHardcodedAnswer(ctx: Context, question: string): Promise<boolean> {
@@ -210,16 +317,17 @@ export class TelegramService implements OnModuleInit {
         return false;
     }
 
+
     private async processQuestionWithAI(ctx: Context, question: string) {
         const userId = ctx?.from?.id;
         if (userId) {
             this.processingUsers.add(userId);
+            let answer = "";
+
             try {
                 const processingMsg = await ctx.reply("در حال پردازش سوال شما...");
+                answer = await this.aiService.getAnswer(question);
 
-                const answer = await this.aiService.getAnswer(question);
-
-                // Delete processing message
                 try {
                     await ctx.deleteMessage(processingMsg.message_id);
                 } catch (deleteErr) {
@@ -227,13 +335,22 @@ export class TelegramService implements OnModuleInit {
                 }
 
                 if (!answer || answer.trim().length === 0 || answer.includes("متاسفانه دراین رابطه اطلاعی ندارم")) {
-                    await ctx.reply("❌ متاسفانه اطلاعات کافی برای پاسخ به این سوال ندارم.", this.mainMenuKeyboard);
+                    answer = "❌ متاسفانه اطلاعات کافی برای پاسخ به این سوال ندارم.";
+                    await ctx.reply(answer, this.mainMenuKeyboard);
                 } else {
                     await ctx.reply(answer, this.mainMenuKeyboard);
                 }
+
+                // Log the message
+                await this.logMessage(ctx, question, answer);
+
             } catch (err) {
                 console.error("Error processing question:", err);
-                await ctx.reply("❌ مشکلی در پردازش سوال شما پیش آمد. لطفاً لحظاتی دیگر دوباره تلاش کنید.", this.mainMenuKeyboard);
+                answer = "❌ مشکلی در پردازش سوال شما پیش آمد. لطفاً لحظاتی دیگر دوباره تلاش کنید.";
+                await ctx.reply(answer, this.mainMenuKeyboard);
+
+                // Log the error response too
+                await this.logMessage(ctx, question, answer);
             } finally {
                 this.processingUsers.delete(userId);
             }

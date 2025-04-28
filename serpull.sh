@@ -1,0 +1,1 @@
+ssh root@157.90.149.206 "source ~/.nvm/nvm.sh && cd /var/www/sphere-telegram.developerpie.com && git pull && pm2 restart 4000-sphere-telegram-prod" 
